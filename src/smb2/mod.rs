@@ -73,7 +73,7 @@ pub fn utf16le_to_string(data: &[u8]) -> String {
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    String::from_utf16_lossy(&u16s)
+    String::from_utf16_lossy(&u16s).trim_end_matches('\0').to_string()
 }
 
 /// Encode a Rust string as UTF-16LE bytes.

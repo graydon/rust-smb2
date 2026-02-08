@@ -262,39 +262,37 @@ pub async fn flush_file(file: &tokio::fs::File) -> std::io::Result<()> {
 
 /// List entries in a directory, applying a simple glob pattern.
 ///
-/// Always includes `.` and `..` entries at the beginning.
+/// Includes `.` and `..` entries only for wildcard (`*`) enumeration.
 pub async fn list_directory(
     dir_path: &Path,
     pattern: &str,
 ) -> std::io::Result<Vec<FileInfo>> {
     let mut entries = Vec::new();
+    let is_wildcard = pattern == "*" || pattern == "*.*";
 
-    // Add "." entry (current directory)
-    if let Ok(dot_info) = stat(dir_path).await {
-        entries.push(FileInfo {
-            name: ".".to_string(),
-            ..dot_info
-        });
-    }
-
-    // Add ".." entry (parent directory)
-    if let Some(parent) = dir_path.parent() {
-        if let Ok(dotdot_info) = stat(parent).await {
+    if is_wildcard {
+        // Add "." entry (current directory)
+        if let Ok(dot_info) = stat(dir_path).await {
             entries.push(FileInfo {
-                name: "..".to_string(),
-                ..dotdot_info
+                name: ".".to_string(),
+                ..dot_info
             });
+        }
+
+        // Add ".." entry (parent directory)
+        if let Some(parent) = dir_path.parent() {
+            if let Ok(dotdot_info) = stat(parent).await {
+                entries.push(FileInfo {
+                    name: "..".to_string(),
+                    ..dotdot_info
+                });
+            }
         }
     }
 
     let mut read_dir = fs::read_dir(dir_path).await?;
     while let Some(entry) = read_dir.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
-
-        // Skip hidden files starting with '.' unless pattern is "*"
-        if name.starts_with('.') && pattern == "*" {
-            // Include dotfiles in wildcard listing
-        }
 
         if !glob_match(pattern, &name) {
             continue;

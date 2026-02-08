@@ -6,6 +6,7 @@ use crate::smb2;
 
 /// Share type constants.
 pub const SHARE_TYPE_DISK: u8 = 0x01;
+pub const SHARE_TYPE_PIPE: u8 = 0x02;
 
 /// Parsed TREE_CONNECT request.
 #[derive(Debug)]

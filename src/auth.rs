@@ -53,6 +53,10 @@ pub fn process_auth(
 ) -> Result<(Vec<u8>, bool), crate::smb2::status::NtStatus> {
     // Strip SPNEGO wrapping to find the raw NTLMSSP token
     let ntlm_token = unwrap_spnego(security_buffer);
+    debug!(input_len = security_buffer.len(),
+           ntlm_len = ntlm_token.len(),
+           state = ?std::mem::discriminant(state),
+           "NTLM: process_auth called");
 
     match state {
         AuthState::Initial => {
@@ -73,6 +77,9 @@ pub fn process_auth(
         }
         AuthState::ChallengeSent { server_challenge } => {
             // Expect AUTHENTICATE_MESSAGE (type 3)
+            debug!(ntlm_token_len = ntlm_token.len(),
+                   first_bytes = ?&ntlm_token[..std::cmp::min(32, ntlm_token.len())],
+                   "NTLM: processing auth message");
             match parse_authenticate_message(&ntlm_token) {
                 Some((username, _domain, _nt_response)) => {
                     // Validate against configured users
@@ -165,8 +172,24 @@ fn unwrap_spnego(data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Wrap an NTLM challenge message in a SPNEGO NegTokenResp (simplified).
+/// Wrap an NTLM challenge message in a SPNEGO NegTokenResp.
+///
+/// Per RFC 4178, the server's first NegTokenResp MUST include the
+/// `supportedMech` field identifying the chosen mechanism (NTLMSSP).
+/// macOS is strict about this — it will abort auth without it.
 fn wrap_spnego_challenge(ntlm_msg: &[u8]) -> Vec<u8> {
+    // negState = accept-incomplete (1)
+    let neg_state: &[u8] = &[0xa0, 0x03, 0x0a, 0x01, 0x01];
+
+    // supportedMech = NTLMSSP OID (1.3.6.1.4.1.311.2.2.10)
+    let ntlmssp_oid: &[u8] = &[
+        0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+    ];
+    let mut supported_mech = Vec::new();
+    supported_mech.push(0xa1); // context [1] (supportedMech)
+    push_der_length(&mut supported_mech, ntlmssp_oid.len());
+    supported_mech.extend_from_slice(ntlmssp_oid);
+
     // responseToken OCTET STRING
     let mut resp_token = Vec::new();
     resp_token.push(0x04); // OCTET STRING
@@ -178,14 +201,12 @@ fn wrap_spnego_challenge(ntlm_msg: &[u8]) -> Vec<u8> {
     push_der_length(&mut resp_token_ctx, resp_token.len());
     resp_token_ctx.extend_from_slice(&resp_token);
 
-    // negState = accept-incomplete (1)
-    let neg_state: &[u8] = &[0xa0, 0x03, 0x0a, 0x01, 0x01];
-
-    let inner_len = neg_state.len() + resp_token_ctx.len();
+    let inner_len = neg_state.len() + supported_mech.len() + resp_token_ctx.len();
     let mut neg_token_resp_seq = Vec::new();
     neg_token_resp_seq.push(0x30); // SEQUENCE
     push_der_length(&mut neg_token_resp_seq, inner_len);
     neg_token_resp_seq.extend_from_slice(neg_state);
+    neg_token_resp_seq.extend_from_slice(&supported_mech);
     neg_token_resp_seq.extend_from_slice(&resp_token_ctx);
 
     let mut result = Vec::new();
@@ -236,28 +257,88 @@ fn is_ntlmssp_negotiate(data: &[u8]) -> bool {
 
 /// Build a minimal NTLM CHALLENGE_MESSAGE (type 2).
 /// MS-NLMP 2.2.1.2
+///
+/// macOS requires TargetInfo AV_PAIRs (at minimum MsvAvNbDomainName,
+/// MsvAvNbComputerName, MsvAvTimestamp and MsvAvEOL) or it will refuse
+/// to send the AUTHENTICATE_MESSAGE.
 fn build_challenge_message(server_challenge: &[u8; 8]) -> Vec<u8> {
     let target_name_utf16 = smb2::string_to_utf16le("SMB");
     let target_name_len = target_name_utf16.len() as u16;
 
-    // Negotiate flags: NTLM | Unicode | TargetTypeServer | RequestTarget
-    let flags: u32 = 0x0000_8233;
+    // Build TargetInfo AV_PAIRs
+    let domain_utf16 = smb2::string_to_utf16le("SMB");
+    let computer_utf16 = smb2::string_to_utf16le("SMB2RS");
+    let dns_domain_utf16 = smb2::string_to_utf16le("smb2rs.local");
+    let dns_computer_utf16 = smb2::string_to_utf16le("smb2rs.smb2rs.local");
 
-    let mut msg = Vec::with_capacity(56 + target_name_utf16.len());
-    msg.extend_from_slice(NTLMSSP_SIG);              // 0..8:   Signature
-    msg.extend_from_slice(&2u32.to_le_bytes());       // 8..12:  MessageType = 2
-    msg.extend_from_slice(&target_name_len.to_le_bytes()); // 12..14: TargetNameLen
-    msg.extend_from_slice(&target_name_len.to_le_bytes()); // 14..16: TargetNameMaxLen
-    msg.extend_from_slice(&56u32.to_le_bytes());      // 16..20: TargetNameBufferOffset
-    msg.extend_from_slice(&flags.to_le_bytes());      // 20..24: NegotiateFlags
-    msg.extend_from_slice(server_challenge);          // 24..32: ServerChallenge
-    msg.extend_from_slice(&[0u8; 8]);                 // 32..40: Reserved
-    // TargetInfo: empty
-    msg.extend_from_slice(&0u16.to_le_bytes());       // 40..42: TargetInfoLen
-    msg.extend_from_slice(&0u16.to_le_bytes());       // 42..44: TargetInfoMaxLen
-    msg.extend_from_slice(&(56 + target_name_utf16.len() as u32).to_le_bytes()); // 44..48: TargetInfoOffset
-    msg.extend_from_slice(&[0u8; 8]);                 // 48..56: Version (8 bytes)
-    msg.extend_from_slice(&target_name_utf16);        // 56..:   TargetName payload
+    // Timestamp: current time as FILETIME
+    let timestamp = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const FILETIME_UNIX_DIFF: u64 = 116444736000000000;
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64 / 100 + FILETIME_UNIX_DIFF)
+            .unwrap_or(FILETIME_UNIX_DIFF)
+    };
+
+    let mut target_info = Vec::new();
+    // MsvAvNbDomainName (AvId=2)
+    target_info.extend_from_slice(&2u16.to_le_bytes());
+    target_info.extend_from_slice(&(domain_utf16.len() as u16).to_le_bytes());
+    target_info.extend_from_slice(&domain_utf16);
+    // MsvAvNbComputerName (AvId=1)
+    target_info.extend_from_slice(&1u16.to_le_bytes());
+    target_info.extend_from_slice(&(computer_utf16.len() as u16).to_le_bytes());
+    target_info.extend_from_slice(&computer_utf16);
+    // MsvAvDnsDomainName (AvId=4)
+    target_info.extend_from_slice(&4u16.to_le_bytes());
+    target_info.extend_from_slice(&(dns_domain_utf16.len() as u16).to_le_bytes());
+    target_info.extend_from_slice(&dns_domain_utf16);
+    // MsvAvDnsComputerName (AvId=3)
+    target_info.extend_from_slice(&3u16.to_le_bytes());
+    target_info.extend_from_slice(&(dns_computer_utf16.len() as u16).to_le_bytes());
+    target_info.extend_from_slice(&dns_computer_utf16);
+    // MsvAvTimestamp (AvId=7, Len=8)
+    target_info.extend_from_slice(&7u16.to_le_bytes());
+    target_info.extend_from_slice(&8u16.to_le_bytes());
+    target_info.extend_from_slice(&timestamp.to_le_bytes());
+    // MsvAvEOL (AvId=0, Len=0)
+    target_info.extend_from_slice(&0u16.to_le_bytes());
+    target_info.extend_from_slice(&0u16.to_le_bytes());
+
+    let target_info_len = target_info.len() as u16;
+
+    // Negotiate flags:
+    // NTLMSSP_NEGOTIATE_UNICODE            0x00000001
+    // NTLMSSP_REQUEST_TARGET               0x00000004
+    // NTLMSSP_NEGOTIATE_NTLM               0x00000200
+    // NTLMSSP_NEGOTIATE_TARGET_INFO        0x00800000
+    // NTLMSSP_TARGET_TYPE_SERVER           0x00020000
+    let flags: u32 = 0x0000_0001
+                   | 0x0000_0004
+                   | 0x0000_0200
+                   | 0x0080_0000
+                   | 0x0002_0000;
+
+    let payload_offset = 56u32;  // fixed header size
+    let target_name_offset = payload_offset;
+    let target_info_offset = payload_offset + target_name_utf16.len() as u32;
+
+    let mut msg = Vec::with_capacity(56 + target_name_utf16.len() + target_info.len());
+    msg.extend_from_slice(NTLMSSP_SIG);                     // 0..8:   Signature
+    msg.extend_from_slice(&2u32.to_le_bytes());              // 8..12:  MessageType = 2
+    msg.extend_from_slice(&target_name_len.to_le_bytes());   // 12..14: TargetNameLen
+    msg.extend_from_slice(&target_name_len.to_le_bytes());   // 14..16: TargetNameMaxLen
+    msg.extend_from_slice(&target_name_offset.to_le_bytes()); // 16..20: TargetNameBufferOffset
+    msg.extend_from_slice(&flags.to_le_bytes());             // 20..24: NegotiateFlags
+    msg.extend_from_slice(server_challenge);                 // 24..32: ServerChallenge
+    msg.extend_from_slice(&[0u8; 8]);                        // 32..40: Reserved
+    msg.extend_from_slice(&target_info_len.to_le_bytes());   // 40..42: TargetInfoLen
+    msg.extend_from_slice(&target_info_len.to_le_bytes());   // 42..44: TargetInfoMaxLen
+    msg.extend_from_slice(&target_info_offset.to_le_bytes()); // 44..48: TargetInfoOffset
+    msg.extend_from_slice(&[0u8; 8]);                        // 48..56: Version
+    msg.extend_from_slice(&target_name_utf16);               // Payload: TargetName
+    msg.extend_from_slice(&target_info);                     // Payload: TargetInfo
 
     msg
 }

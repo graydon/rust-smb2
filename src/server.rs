@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use bytes::BytesMut;
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn, instrument};
+use tracing::{debug, info, warn};
 
-use crate::config::{Config, ShareConfig};
-use crate::smb2::header::{Smb2Header, SMB2_HEADER_SIZE, FLAGS_SERVER_TO_REDIR};
+use crate::config::Config;
+use crate::smb2::header::{Smb2Header, SMB2_HEADER_SIZE};
 use crate::smb2::status::NtStatus;
 use crate::smb2::{self, Smb2Command};
 use crate::transport;
@@ -41,6 +41,8 @@ impl ServerState {
 /// Phase of the connection lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnPhase {
+    /// Waiting for the initial Negotiate request.
+    #[allow(dead_code)] // Set as initial state, checked implicitly via transitions
     AwaitNegotiate,
     Negotiated,
     Active,
@@ -56,6 +58,8 @@ struct ConnectionState {
 
 struct SessionState {
     username: String,
+    /// Session key from authentication; retained for future signing support.
+    #[allow(dead_code)]
     session_key: Vec<u8>,
     auth_state: AuthState,
     trees: HashMap<u32, TreeState>,
@@ -63,6 +67,8 @@ struct SessionState {
 }
 
 struct TreeState {
+    /// Human-readable share name; retained for diagnostics/logging.
+    #[allow(dead_code)]
     share_name: String,
     share_path: PathBuf,
     open_files: HashMap<u64, OpenFile>,
@@ -117,10 +123,14 @@ pub async fn handle_connection(
             return Ok(());
         }
 
-        // Reject SMB1
+        // Handle SMB1 multi-protocol negotiate by responding with
+        // an SMB2 negotiate response (dialect 0x02FF) that tells the
+        // client to retry using SMB2.  macOS sends SMB1 negotiate first.
         if frame.len() >= 4 && frame[0] == 0xFF && &frame[1..4] == b"SMB" {
-            warn!("SMB1 connection rejected");
-            return Ok(());
+            info!("SMB1 negotiate received, responding with SMB2 wildcard dialect");
+            let smb2_resp = build_smb1_to_smb2_negotiate_response(&server);
+            transport::write_frame(&mut stream, &smb2_resp).await?;
+            continue;
         }
 
         let header = match Smb2Header::parse(&frame) {
@@ -131,23 +141,138 @@ pub async fn handle_connection(
             }
         };
 
-        let body = &frame[SMB2_HEADER_SIZE..];
+        // Handle compound (chained) requests: walk the frame using next_command
+        // offsets, dispatch each, and send all responses in a single compound frame.
+        let mut messages: Vec<(Smb2Header, &[u8])> = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            if offset + SMB2_HEADER_SIZE > frame.len() {
+                break;
+            }
+            let msg_slice = &frame[offset..];
+            let hdr = match Smb2Header::parse(msg_slice) {
+                Some(h) => h,
+                None => break,
+            };
+            let next = hdr.next_command;
+            let msg_end = if next > 0 {
+                (next as usize).min(msg_slice.len())
+            } else {
+                msg_slice.len()
+            };
+            let body = if SMB2_HEADER_SIZE < msg_end {
+                &msg_slice[SMB2_HEADER_SIZE..msg_end]
+            } else {
+                &[]
+            };
+            messages.push((hdr, body));
+            if next == 0 {
+                break;
+            }
+            offset += next as usize;
+        }
 
-        debug!(
-            command = ?Smb2Command::from_u16(header.command),
-            message_id = header.message_id,
-            session_id = header.session_id,
-            tree_id = header.tree_id,
-            "Received request"
-        );
+        // If we couldn't parse any messages, fall back to the single header we parsed above
+        if messages.is_empty() {
+            let body = &frame[SMB2_HEADER_SIZE..];
+            messages.push((header, body));
+        }
 
-        let (resp_header, resp_body) =
-            dispatch(&mut conn, &server, &header, body).await;
+        let msg_count = messages.len();
+        let mut resp_buf = BytesMut::with_capacity(256 * msg_count);
 
-        // Build response frame
-        let mut resp_buf = BytesMut::with_capacity(SMB2_HEADER_SIZE + resp_body.len());
-        resp_header.serialize(&mut resp_buf);
-        resp_buf.extend_from_slice(&resp_body);
+        // For related compound requests, carry session_id/tree_id/file_id forward
+        let mut last_session_id: u64 = 0;
+        let mut last_tree_id: u32 = 0;
+        let mut compound_file_id: Option<u64> = None;
+
+        for (i, (mut msg_header, body)) in messages.into_iter().enumerate() {
+            // SMB2_FLAGS_RELATED_OPERATIONS = 0x00000004
+            let is_related = (msg_header.flags & 0x0000_0004) != 0;
+            if is_related {
+                if msg_header.session_id == 0 {
+                    msg_header.session_id = last_session_id;
+                }
+                if msg_header.tree_id == 0 {
+                    msg_header.tree_id = last_tree_id;
+                }
+            }
+
+            // For related compound operations, replace sentinel file_id
+            // (0xFFFFFFFF_FFFFFFFF) with the file_id from the preceding Create.
+            let body_owned;
+            let dispatch_body: &[u8] = if is_related {
+                if let Some(fid) = compound_file_id {
+                    let sentinel = 0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes();
+                    let replacement = fid.to_le_bytes();
+                    let mut patched = body.to_vec();
+                    // Replace all occurrences of the 8-byte sentinel in the body
+                    for pos in 0..patched.len().saturating_sub(7) {
+                        if patched[pos..pos + 8] == sentinel {
+                            patched[pos..pos + 8].copy_from_slice(&replacement);
+                        }
+                    }
+                    body_owned = patched;
+                    &body_owned
+                } else {
+                    body
+                }
+            } else {
+                body
+            };
+
+            debug!(
+                command = ?Smb2Command::from_u16(msg_header.command),
+                message_id = msg_header.message_id,
+                session_id = msg_header.session_id,
+                tree_id = msg_header.tree_id,
+                compound_index = i,
+                compound_total = msg_count,
+                "Received request"
+            );
+
+            let (resp_header, resp_body) =
+                dispatch(&mut conn, &server, &msg_header, dispatch_body).await;
+
+            last_session_id = resp_header.session_id;
+            last_tree_id = resp_header.tree_id;
+
+            // If this was a successful Create, extract the file_id for subsequent
+            // related operations (QueryInfo, Close, etc.)
+            if msg_header.command == Smb2Command::Create as u16
+                && resp_header.status == NtStatus::Success
+                && resp_body.len() >= 80
+            {
+                // CreateResponse: file_id_persistent at offset 64, file_id_volatile at offset 72
+                let fid = u64::from_le_bytes(
+                    resp_body[72..80].try_into().unwrap_or([0u8; 8]),
+                );
+                compound_file_id = Some(fid);
+            }
+
+            last_session_id = resp_header.session_id;
+            last_tree_id = resp_header.tree_id;
+
+            let resp_msg_len = SMB2_HEADER_SIZE + resp_body.len();
+            // Pad to 8-byte alignment for all but the last response in a compound
+            let padded_len = if i + 1 < msg_count {
+                (resp_msg_len + 7) & !7
+            } else {
+                resp_msg_len
+            };
+
+            let start = resp_buf.len();
+            // Write header, we'll fix next_command after
+            let mut rh = resp_header;
+            rh.next_command = if i + 1 < msg_count { padded_len as u32 } else { 0 };
+            rh.serialize(&mut resp_buf);
+            resp_buf.extend_from_slice(&resp_body);
+            // Pad if needed
+            let padding = padded_len - resp_msg_len;
+            if padding > 0 {
+                resp_buf.extend_from_slice(&vec![0u8; padding]);
+            }
+        }
 
         transport::write_frame(&mut stream, &resp_buf).await?;
     }
@@ -242,6 +367,53 @@ where
     Ok((Smb2Header::new_response(header, status), buf.to_vec()))
 }
 
+/// Build an SMB2 Negotiate response to an SMB1 multi-protocol negotiate.
+///
+/// When a client (e.g. macOS) sends an SMB1 negotiate listing SMB2/3 dialects,
+/// we respond with a full SMB2 Negotiate response using dialect 0x02FF
+/// ("SMB 2.???"), which tells the client to restart negotiation using SMB2.
+fn build_smb1_to_smb2_negotiate_response(server: &Arc<ServerState>) -> Vec<u8> {
+    use bytes::BufMut;
+
+    let security_buffer = auth::build_spnego_init();
+
+    // Build the SMB2 Negotiate response body
+    let resp = smb2::negotiate::NegotiateResponse {
+        security_mode: 0x01,
+        dialect: 0x02FF,  // SMB 2.??? wildcard — client must re-negotiate
+        server_guid: server.server_guid,
+        capabilities: 0,
+        max_transact_size: 1_048_576,
+        max_read_size: 1_048_576,
+        max_write_size: 1_048_576,
+        security_buffer,
+    };
+
+    // Build a minimal SMB2 header for the negotiate response
+    let mut hdr = Smb2Header::new_response(
+        &Smb2Header {
+            credit_charge: 0,
+            status: NtStatus::Success,
+            command: 0, // NEGOTIATE
+            credits_requested: 1,
+            flags: 0,
+            next_command: 0,
+            message_id: 0,
+            async_id: 0,
+            tree_id: 0,
+            session_id: 0,
+            signature: [0u8; 16],
+        },
+        NtStatus::Success,
+    );
+    hdr.credits_requested = 1;
+
+    let mut out = BytesMut::with_capacity(256);
+    hdr.serialize(&mut out);
+    resp.serialize(&mut out);
+    out.to_vec()
+}
+
 // ---- Command handlers ----
 
 async fn handle_negotiate(
@@ -253,11 +425,20 @@ async fn handle_negotiate(
     let req = smb2::negotiate::NegotiateRequest::parse(body)
         .ok_or(NtStatus::InvalidParameter)?;
 
-    // Pick highest supported dialect (prefer 2.10)
-    let dialect = if req.dialects.contains(&0x0210) {
-        0x0210
+    // Pick highest supported dialect.  We genuinely implement SMB 2.x semantics,
+    // but many modern clients (macOS, Windows 10+) only offer SMB 3.x dialects.
+    // We accept SMB 3.0/3.0.2 and negotiate them – the wire format is compatible
+    // enough for our basic feature set (no encryption, no secure negotiate, no
+    // multi-channel).  SMB 3.1.1 requires negotiate contexts we don't implement,
+    // so we avoid it.
+    let dialect = if req.dialects.contains(&0x0302) {
+        0x0302 // SMB 3.0.2
+    } else if req.dialects.contains(&0x0300) {
+        0x0300 // SMB 3.0
+    } else if req.dialects.contains(&0x0210) {
+        0x0210 // SMB 2.1
     } else if req.dialects.contains(&0x0202) {
-        0x0202
+        0x0202 // SMB 2.0.2
     } else {
         return Err(NtStatus::NotSupported);
     };
@@ -293,6 +474,10 @@ async fn handle_session_setup(
 ) -> HandlerResult {
     let req = smb2::session::SessionSetupRequest::parse(body)
         .ok_or(NtStatus::InvalidParameter)?;
+
+    debug!(security_buffer_len = req.security_buffer.len(),
+           session_id = header.session_id,
+           "SessionSetup request received");
 
     // Find or create session
     let session_id = if header.session_id == 0 {
@@ -361,8 +546,15 @@ async fn handle_session_setup(
     let mut resp_header = Smb2Header::new_response(header, status);
     resp_header.session_id = session_id;
 
+    // Flag guest sessions so the client knows not to expect signing
+    let session_flags = if complete && guest_ok {
+        0x0001 // SMB2_SESSION_FLAG_IS_GUEST
+    } else {
+        0
+    };
+
     let resp = smb2::session::SessionSetupResponse {
-        session_flags: 0,
+        session_flags,
         security_buffer: resp_token,
     };
 
@@ -393,14 +585,46 @@ async fn handle_tree_connect(
 
     // Extract share name from \\server\share path
     let share_name = req.path
+        .trim_end_matches('\0')
         .rsplit('\\')
         .next()
         .unwrap_or(&req.path)
         .to_string();
 
+    debug!(path = %req.path, share_name = %share_name, "TreeConnect path parsed");
+
+    // Handle IPC$ as a virtual named-pipe share (some clients probe for it)
+    if share_name.eq_ignore_ascii_case("IPC$") {
+        let session = conn.sessions.get_mut(&header.session_id)
+            .ok_or(NtStatus::AccessDenied)?;
+        let tree_id = session.next_tree_id;
+        session.next_tree_id += 1;
+        session.trees.insert(tree_id, TreeState {
+            share_name: "IPC$".to_string(),
+            share_path: PathBuf::new(),
+            open_files: HashMap::new(),
+            next_file_id: 1,
+        });
+        info!(share = "IPC$", tree_id, "Tree connected (IPC)");
+        let mut resp_header = Smb2Header::new_response(header, NtStatus::Success);
+        resp_header.tree_id = tree_id;
+        let resp = smb2::tree::TreeConnectResponse {
+            share_type: smb2::tree::SHARE_TYPE_PIPE,
+            share_flags: 0,
+            capabilities: 0,
+            maximal_access: 0x001F_01FF,
+        };
+        let mut buf = BytesMut::with_capacity(16);
+        resp.serialize(&mut buf);
+        return Ok((resp_header, buf.to_vec()));
+    }
+
     let share = server.config.shares.iter()
         .find(|s| s.name.eq_ignore_ascii_case(&share_name))
-        .ok_or(NtStatus::BadNetworkName)?;
+        .ok_or_else(|| {
+            warn!(share_name = %share_name, available = ?server.config.shares.iter().map(|s| &s.name).collect::<Vec<_>>(), "Share not found");
+            NtStatus::BadNetworkName
+        })?;
 
     let session = conn.sessions.get_mut(&header.session_id)
         .ok_or(NtStatus::AccessDenied)?;
@@ -451,8 +675,7 @@ async fn handle_create(
     let req = smb2::create::CreateRequest::parse(body)
         .ok_or(NtStatus::InvalidParameter)?;
 
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     let full_path = vfs::safe_resolve(&tree.share_path, &req.filename)
         .ok_or(NtStatus::ObjectPathNotFound)?;
@@ -513,8 +736,7 @@ async fn handle_close(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     let open = tree.open_files.remove(&file_id);
 
@@ -553,8 +775,7 @@ async fn handle_flush(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     if let Some(open) = tree.open_files.get(&file_id) {
         if let Some(ref handle) = open.handle {
@@ -576,8 +797,7 @@ async fn handle_read(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     let open = tree.open_files.get(&file_id)
         .ok_or(NtStatus::InvalidParameter)?;
@@ -608,8 +828,7 @@ async fn handle_write(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     let open = tree.open_files.get(&file_id)
         .ok_or(NtStatus::InvalidParameter)?;
@@ -634,8 +853,13 @@ async fn handle_query_directory(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
+
+    debug!(file_id, 
+           file_info_class = req.file_information_class,
+           pattern = %req.file_name_pattern,
+           restart = req.restart_scan(),
+           "QueryDirectory request");
 
     let open = tree.open_files.get_mut(&file_id)
         .ok_or(NtStatus::InvalidParameter)?;
@@ -662,7 +886,16 @@ async fn handle_query_directory(
 
     open.dir_enumerated = true;
 
-    let data = smb2::query::serialize_file_both_dir_info(&entries);
+    let data = match req.file_information_class {
+        smb2::query::FILE_ID_BOTH_DIRECTORY_INFORMATION =>
+            smb2::query::serialize_file_id_both_dir_info(&entries),
+        _ =>
+            smb2::query::serialize_file_both_dir_info(&entries),
+    };
+
+    debug!(file_id, entry_count = entries.len(), data_len = data.len(),
+           first_entry = %entries.first().map(|e| e.name.as_str()).unwrap_or(""),
+           "QueryDirectory response");
 
     let resp = smb2::query::QueryDirectoryResponse { data };
     let mut buf = BytesMut::with_capacity(resp.data.len() + 8);
@@ -679,8 +912,7 @@ async fn handle_query_info(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     let open = tree.open_files.get(&file_id)
         .ok_or(NtStatus::InvalidParameter)?;
@@ -750,8 +982,7 @@ async fn handle_set_info(
         .ok_or(NtStatus::InvalidParameter)?;
 
     let file_id = req.file_id_volatile;
-    let tree =
-        get_tree(conn, header.session_id, header.tree_id)?;
+    let tree = get_tree(conn, header.session_id, header.tree_id)?;
 
     let open = tree.open_files.get(&file_id)
         .ok_or(NtStatus::InvalidParameter)?;

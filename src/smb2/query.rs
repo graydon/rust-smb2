@@ -244,8 +244,8 @@ pub fn serialize_file_both_dir_info(entries: &[FileInfo]) -> Vec<u8> {
     for (i, entry) in entries.iter().enumerate() {
         let name_utf16 = smb2::string_to_utf16le(&entry.name);
         let name_len = name_utf16.len();
-        // Fixed fields = 94 bytes, then filename
-        let entry_size = 94 + name_len;
+        // Fixed fields = 96 bytes, then filename
+        let entry_size = 96 + name_len;
         let padded = (entry_size + 7) & !7; // 8-byte align
 
         let next_offset = if i < count - 1 { padded as u32 } else { 0 };
@@ -263,6 +263,46 @@ pub fn serialize_file_both_dir_info(entries: &[FileInfo]) -> Vec<u8> {
         buf.put_u8(0);                               // ShortNameLength
         buf.put_u8(0);                               // Reserved
         buf.put_slice(&[0u8; 24]);                   // ShortName (24 bytes)
+        buf.put_slice(&name_utf16);                  // FileName
+
+        // Pad to 8-byte alignment
+        let padding = padded - entry_size;
+        if padding > 0 {
+            buf.put_slice(&vec![0u8; padding]);
+        }
+    }
+    buf.to_vec()
+}
+
+/// Serialize a list of FileInfo into FileIdBothDirectoryInformation entries.
+/// MS-FSCC 2.4.17
+pub fn serialize_file_id_both_dir_info(entries: &[FileInfo]) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    let count = entries.len();
+    for (i, entry) in entries.iter().enumerate() {
+        let name_utf16 = smb2::string_to_utf16le(&entry.name);
+        let name_len = name_utf16.len();
+        // Fixed fields = 104 bytes, then filename
+        let entry_size = 104 + name_len;
+        let padded = (entry_size + 7) & !7; // 8-byte align
+
+        let next_offset = if i < count - 1 { padded as u32 } else { 0 };
+        buf.put_u32_le(next_offset);                 // NextEntryOffset
+        buf.put_u32_le(i as u32);                    // FileIndex
+        buf.put_u64_le(entry.creation_time);         // CreationTime
+        buf.put_u64_le(entry.last_access_time);      // LastAccessTime
+        buf.put_u64_le(entry.last_write_time);       // LastWriteTime
+        buf.put_u64_le(entry.change_time);           // ChangeTime
+        buf.put_u64_le(entry.end_of_file);           // EndOfFile
+        buf.put_u64_le(entry.allocation_size);       // AllocationSize
+        buf.put_u32_le(entry.file_attributes);       // FileAttributes
+        buf.put_u32_le(name_len as u32);             // FileNameLength
+        buf.put_u32_le(0);                           // EaSize
+        buf.put_u8(0);                               // ShortNameLength
+        buf.put_u8(0);                               // Reserved1
+        buf.put_slice(&[0u8; 24]);                   // ShortName (24 bytes)
+        buf.put_u16_le(0);                           // Reserved2
+        buf.put_u64_le(i as u64);                    // FileId
         buf.put_slice(&name_utf16);                  // FileName
 
         // Pad to 8-byte alignment
