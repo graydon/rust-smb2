@@ -1,0 +1,17 @@
+# SMB2-RS Configuration
+
+# TCP port to listen on. Standard SMB port is 445 (requires root).
+# Use a high port like 4450 for non-root testing.
+port = 4450
+
+# Server name advertised to clients
+server_name = "smb2rs"
+
+# Shared directories
+[[shares]]
+name = "Public"
+path = "/Users/Shared"
+
+# [[shares]]
+# name = "Documents"
+# path = "/Users/you/Documents"

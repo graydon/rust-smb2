@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.smb2rs.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/smb2-rs</string>
+        <string>--config</string>
+        <string>/etc/smb2-rs/config.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/smb2-rs/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/smb2-rs/stderr.log</string>
+</dict>
+</plist>
